@@ -110,45 +110,71 @@ async fn handle_message(text: &str, server: &Arc<ServerState>, sessions: &Arc<Se
     }
 
     for n in notification.notification_container.play_session_state_notification {
-        let state = SessionState::from_plex(&n.state);
-
-        if state == SessionState::Stopped {
-            // When the session is stopped we can't look up the user info or media anymore.
-            sessions.update(&n.session_key, state, None, None);
-            continue;
+        if let Err(e) = handle_notification(n, server, sessions).await {
+            tracing::warn!(error = %e, "skipping websocket notification");
         }
+    }
 
+    Ok(())
+}
+
+/// Number of times to retry looking up a session in `/status/sessions` after
+/// a "playing" notification. Plex's session list lags slightly behind its own
+/// websocket notifications, so a fresh session can briefly be missing from it.
+const SESSION_LOOKUP_RETRIES: u32 = 3;
+const SESSION_LOOKUP_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+async fn handle_notification(
+    n: crate::plex::models::PlaySessionStateNotification,
+    server: &Arc<ServerState>,
+    sessions: &Arc<Sessions>,
+) -> anyhow::Result<()> {
+    let state = SessionState::from_plex(&n.state);
+
+    if state == SessionState::Stopped {
+        // When the session is stopped we can't look up the user info or media anymore.
+        sessions.update(&n.session_key, state, None, None);
+        return Ok(());
+    }
+
+    let mut session = None;
+    for attempt in 0..=SESSION_LOOKUP_RETRIES {
         let current: CurrentSessions = server.client.get("/status/sessions").await?;
-        let session = current
+        session = current
             .media_container
             .metadata
             .into_iter()
             .find(|m| m.session_key == n.session_key);
 
-        let Some(session) = session else {
-            anyhow::bail!("no active session found for session key {}", n.session_key);
-        };
-
-        let metadata: MediaMetadataResponse = server
-            .client
-            .get(&format!("/library/metadata/{}", n.rating_key))
-            .await?;
-
-        let Some(media) = metadata.media_container.metadata.into_iter().next() else {
-            anyhow::bail!("no metadata found for rating key {}", n.rating_key);
-        };
-
-        tracing::info!(
-            session_key = %n.session_key,
-            user = %session.user.title,
-            state = %n.state,
-            media_title = %media.title,
-            media_id = %media.rating_key,
-            "received PlaySessionStateNotification",
-        );
-
-        sessions.update(&n.session_key, state, Some(session), Some(media));
+        if session.is_some() || attempt == SESSION_LOOKUP_RETRIES {
+            break;
+        }
+        tokio::time::sleep(SESSION_LOOKUP_RETRY_DELAY).await;
     }
+
+    let Some(session) = session else {
+        anyhow::bail!("no active session found for session key {}", n.session_key);
+    };
+
+    let metadata: MediaMetadataResponse = server
+        .client
+        .get(&format!("/library/metadata/{}", n.rating_key))
+        .await?;
+
+    let Some(media) = metadata.media_container.metadata.into_iter().next() else {
+        anyhow::bail!("no metadata found for rating key {}", n.rating_key);
+    };
+
+    tracing::info!(
+        session_key = %n.session_key,
+        user = %session.user.title,
+        state = %n.state,
+        media_title = %media.title,
+        media_id = %media.rating_key,
+        "received PlaySessionStateNotification",
+    );
+
+    sessions.update(&n.session_key, state, Some(session), Some(media));
 
     Ok(())
 }
