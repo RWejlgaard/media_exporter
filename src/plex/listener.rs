@@ -4,13 +4,13 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::watch;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
 use tokio_tungstenite::tungstenite::http::Uri;
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::plex::models::{CurrentSessions, MediaMetadataResponse, WebsocketNotification};
 use crate::plex::server::ServerState;
-use crate::plex::sessions::{Sessions, SessionState};
+use crate::plex::sessions::{SessionState, Sessions};
 
 /// Connects to the Plex server's notification websocket and forwards
 /// playback state changes into `Sessions`. Reconnects with a fixed delay on
@@ -30,7 +30,10 @@ pub async fn run(server: Arc<ServerState>, sessions: Arc<Sessions>, mut shutdown
         }
 
         if !first_attempt {
-            metrics.websocket_reconnects_total.with_label_values(&label_values).inc();
+            metrics
+                .websocket_reconnects_total
+                .with_label_values(&label_values)
+                .inc();
         }
         first_attempt = false;
 

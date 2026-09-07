@@ -7,7 +7,7 @@ use prometheus::{GaugeVec, Opts};
 
 use crate::metrics::{GlobalMetrics, LIBRARY_LABELS};
 use crate::plex::client::{Client, ClientError};
-use crate::plex::library::{is_library_directory_type, Library};
+use crate::plex::library::{Library, is_library_directory_type};
 use crate::plex::models::{
     BandwidthResponse, LibraryItemsResponse, ProvidersResponse, ResourcesResponse, RootResponse,
 };
@@ -24,11 +24,7 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub async fn connect(
-        server_url: &str,
-        token: &str,
-        metrics: Arc<GlobalMetrics>,
-    ) -> Result<Arc<Self>, ClientError> {
+    pub async fn connect(server_url: &str, token: &str, metrics: Arc<GlobalMetrics>) -> Result<Arc<Self>, ClientError> {
         let client = Client::new(server_url, token)?;
 
         let state = Arc::new(Self {
@@ -62,19 +58,24 @@ impl ServerState {
     }
 
     pub fn id(&self) -> String {
-        self.id.read().unwrap().clone()
+        self.id.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn name(&self) -> String {
-        self.name.read().unwrap().clone()
+        self.name.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn library(&self, id: &str) -> Option<Library> {
-        self.libraries.read().unwrap().iter().find(|l| l.id == id).cloned()
+        self.libraries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
     }
 
     pub fn libraries(&self) -> Vec<Library> {
-        self.libraries.read().unwrap().clone()
+        self.libraries.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     async fn refresh(&self) -> Result<(), ClientError> {
@@ -114,9 +115,9 @@ impl ServerState {
             }
         }
 
-        *self.id.write().unwrap() = container.media_container.machine_identifier;
-        *self.name.write().unwrap() = container.media_container.friendly_name;
-        *self.libraries.write().unwrap() = libraries;
+        *self.id.write().unwrap_or_else(|e| e.into_inner()) = container.media_container.machine_identifier;
+        *self.name.write().unwrap_or_else(|e| e.into_inner()) = container.media_container.friendly_name;
+        *self.libraries.write().unwrap_or_else(|e| e.into_inner()) = libraries;
 
         self.refresh_server_info().await?;
         self.refresh_resources().await?;
@@ -193,26 +194,40 @@ impl ServerState {
         let mut updates = resp.media_container.statistics_bandwidth;
         updates.sort_by_key(|u| u.at);
 
-        let mut last_bandwidth_at = self.last_bandwidth_at.lock().unwrap();
-        let mut highest = *last_bandwidth_at;
-        let name = self.name();
-        let id = self.id();
-        for u in &updates {
-            if u.at > *last_bandwidth_at {
-                self.metrics
-                    .transmit_bytes_total
-                    .with_label_values(&["plex", &name, &id])
-                    .inc_by(u.bytes as f64);
+        let mut last_bandwidth_at = self.last_bandwidth_at.lock().unwrap_or_else(|e| e.into_inner());
+        let (highest, total_bytes) = accumulate_bandwidth(*last_bandwidth_at, &updates);
 
-                if u.at > highest {
-                    highest = u.at;
-                }
-            }
+        if total_bytes > 0 {
+            let name = self.name();
+            let id = self.id();
+            self.metrics
+                .transmit_bytes_total
+                .with_label_values(&["plex", &name, &id])
+                .inc_by(total_bytes as f64);
         }
         *last_bandwidth_at = highest;
 
         Ok(())
     }
+}
+
+/// Sums the bytes of bandwidth updates newer than `last_bandwidth_at`, and
+/// returns the new high-water mark alongside that sum. `updates` must be
+/// sorted by `at` ascending.
+fn accumulate_bandwidth(last_bandwidth_at: i64, updates: &[crate::plex::models::StatisticsBandwidth]) -> (i64, i64) {
+    let mut highest = last_bandwidth_at;
+    let mut total_bytes: i64 = 0;
+
+    for u in updates {
+        if u.at > last_bandwidth_at {
+            total_bytes += u.bytes;
+            if u.at > highest {
+                highest = u.at;
+            }
+        }
+    }
+
+    (highest, total_bytes)
 }
 
 fn unix_now() -> i64 {
@@ -292,5 +307,38 @@ impl Collector for ServerCollector {
         mfs.extend(self.library_storage_total.collect());
         mfs.extend(self.library_items_total.collect());
         mfs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plex::models::StatisticsBandwidth;
+
+    fn update(at: i64, bytes: i64) -> StatisticsBandwidth {
+        StatisticsBandwidth { at, bytes }
+    }
+
+    #[test]
+    fn accumulates_only_updates_newer_than_watermark() {
+        let updates = vec![update(10, 100), update(20, 200), update(30, 300)];
+        let (highest, total) = accumulate_bandwidth(20, &updates);
+        assert_eq!(highest, 30);
+        assert_eq!(total, 300);
+    }
+
+    #[test]
+    fn no_new_updates_leaves_watermark_and_total_unchanged() {
+        let updates = vec![update(5, 100), update(10, 200)];
+        let (highest, total) = accumulate_bandwidth(10, &updates);
+        assert_eq!(highest, 10);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn empty_updates_are_a_no_op() {
+        let (highest, total) = accumulate_bandwidth(42, &[]);
+        assert_eq!(highest, 42);
+        assert_eq!(total, 0);
     }
 }

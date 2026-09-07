@@ -266,3 +266,52 @@ pub struct BandwidthResponse {
     #[serde(default, rename = "MediaContainer")]
     pub media_container: BandwidthMediaContainer,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn num_or_string_accepts_number() {
+        let v: NumOrString = serde_json::from_str("42").unwrap();
+        assert_eq!(v.0, "42");
+    }
+
+    #[test]
+    fn num_or_string_accepts_string() {
+        let v: NumOrString = serde_json::from_str("\"42\"").unwrap();
+        assert_eq!(v.0, "42");
+    }
+
+    #[test]
+    fn num_or_string_accepts_null() {
+        let v: NumOrString = serde_json::from_str("null").unwrap();
+        assert_eq!(v.0, "");
+    }
+
+    #[test]
+    fn play_labels_for_episode_uses_grandparent_parent_title() {
+        let metadata = Metadata {
+            media_type: "episode".to_string(),
+            title: "Episode Title".to_string(),
+            parent_title: "Season 1".to_string(),
+            grandparent_title: "Show Title".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(metadata.play_labels(), ("Show Title", "Season 1", "Episode Title"));
+    }
+
+    #[test]
+    fn play_labels_for_movie_uses_only_title() {
+        let metadata = Metadata {
+            media_type: "movie".to_string(),
+            title: "Movie Title".to_string(),
+            parent_title: "should be ignored".to_string(),
+            grandparent_title: "should be ignored".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(metadata.play_labels(), ("Movie Title", "", ""));
+    }
+}
