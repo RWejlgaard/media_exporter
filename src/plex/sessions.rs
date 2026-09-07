@@ -6,7 +6,7 @@ use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use prometheus::{CounterVec, GaugeVec, Opts};
 
-use crate::metrics::{active_session_labels, PLAY_LABELS, SERVER_LABELS};
+use crate::metrics::{PLAY_LABELS, SERVER_LABELS, active_session_labels};
 use crate::plex::models::Metadata;
 use crate::plex::server::ServerState;
 
@@ -38,9 +38,15 @@ impl SessionState {
     }
 }
 
-/// How long metrics for sessions are kept after the last update. Used to
-/// prune tracked sessions and keep cardinality down.
+/// How long metrics for a stopped session are kept after its last update.
+/// Used to prune tracked sessions and keep cardinality down.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Safety-net timeout for sessions that never receive a "stopped"
+/// notification (e.g. the exporter misses it across a reconnect or the Plex
+/// server restarts mid-session). Without this, such a session would report
+/// `plex_active_sessions=1` forever.
+const STALE_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
 struct SessionEntry {
@@ -50,6 +56,16 @@ struct SessionEntry {
     last_update: Option<Instant>,
     play_started: Option<Instant>,
     prev_played: Duration,
+    play_count: u64,
+}
+
+/// Whether a tracked session should be dropped, given its current state and
+/// time since its last update.
+fn should_prune(state: Option<SessionState>, elapsed: Duration) -> bool {
+    match state {
+        Some(SessionState::Stopped) => elapsed > SESSION_TIMEOUT,
+        _ => elapsed > STALE_SESSION_TIMEOUT,
+    }
 }
 
 struct SessionsInner {
@@ -89,13 +105,11 @@ impl Sessions {
     }
 
     fn prune_old_sessions(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.sessions.retain(|_, entry| {
-            !(entry.state == Some(SessionState::Stopped)
-                && entry
-                    .last_update
-                    .map(|t| t.elapsed() > SESSION_TIMEOUT)
-                    .unwrap_or(false))
+            !entry
+                .last_update
+                .is_some_and(|t| should_prune(entry.state, t.elapsed()))
         });
     }
 
@@ -106,7 +120,7 @@ impl Sessions {
         new_session: Option<Metadata>,
         media: Option<Metadata>,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let entry = inner.sessions.entry(session_id.to_string()).or_default();
 
         if let Some(s) = new_session {
@@ -130,6 +144,7 @@ impl Sessions {
 
         if entry.state != Some(SessionState::Playing) && new_state == SessionState::Playing {
             entry.play_started = Some(Instant::now());
+            entry.play_count += 1;
         }
 
         entry.state = Some(new_state);
@@ -142,11 +157,11 @@ impl Sessions {
         let mut total = inner.total_estimated_transmitted_kbits;
 
         for entry in inner.sessions.values() {
-            if entry.state == Some(SessionState::Playing) {
-                if let Some(started) = entry.play_started {
-                    let bitrate = entry.session.media.first().map(|m| m.bitrate).unwrap_or(0) as f64;
-                    total += started.elapsed().as_secs_f64() * bitrate;
-                }
+            if entry.state == Some(SessionState::Playing)
+                && let Some(started) = entry.play_started
+            {
+                let bitrate = entry.session.media.first().map(|m| m.bitrate).unwrap_or(0) as f64;
+                total += started.elapsed().as_secs_f64() * bitrate;
             }
         }
 
@@ -231,7 +246,7 @@ impl Collector for SessionsCollector {
         let server_name = server.name();
         let server_id = server.id();
 
-        let inner = self.sessions.inner.lock().unwrap();
+        let inner = self.sessions.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         for (id, entry) in inner.sessions.iter() {
             let Some(play_started) = entry.play_started else {
@@ -276,7 +291,9 @@ impl Collector for SessionsCollector {
                 id,
             ];
 
-            self.plays_total.with_label_values(&label_values).inc();
+            self.plays_total
+                .with_label_values(&label_values)
+                .inc_by(entry.play_count as f64);
 
             let mut total_play_time = entry.prev_played;
             if entry.state == Some(SessionState::Playing) {
@@ -286,18 +303,20 @@ impl Collector for SessionsCollector {
                 .with_label_values(&label_values)
                 .inc_by(total_play_time.as_secs_f64());
 
-            if let Some(state) = entry.state {
-                if state != SessionState::Stopped {
-                    let mut active_label_values = label_values.to_vec();
-                    active_label_values.push(state.as_str());
-                    self.active_sessions.with_label_values(&active_label_values).set(1.0);
+            if let Some(state) = entry.state
+                && state != SessionState::Stopped
+            {
+                let mut active_label_values = label_values.to_vec();
+                active_label_values.push(state.as_str());
+                self.active_sessions.with_label_values(&active_label_values).set(1.0);
 
-                    if let Some(transcode) = &entry.session.transcode_session {
-                        self.transcode_speed.with_label_values(&label_values).set(transcode.speed);
-                        self.transcode_throttled
-                            .with_label_values(&label_values)
-                            .set(if transcode.throttled { 1.0 } else { 0.0 });
-                    }
+                if let Some(transcode) = &entry.session.transcode_session {
+                    self.transcode_speed
+                        .with_label_values(&label_values)
+                        .set(transcode.speed);
+                    self.transcode_throttled
+                        .with_label_values(&label_values)
+                        .set(if transcode.throttled { 1.0 } else { 0.0 });
                 }
             }
         }
@@ -315,5 +334,50 @@ impl Collector for SessionsCollector {
         mfs.extend(self.transcode_speed.collect());
         mfs.extend(self.transcode_throttled.collect());
         mfs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_state_from_plex_maps_known_states() {
+        assert_eq!(SessionState::from_plex("playing"), SessionState::Playing);
+        assert_eq!(SessionState::from_plex("paused"), SessionState::Paused);
+        assert_eq!(SessionState::from_plex("buffering"), SessionState::Buffering);
+    }
+
+    #[test]
+    fn session_state_from_plex_defaults_unknown_to_stopped() {
+        assert_eq!(SessionState::from_plex("stopped"), SessionState::Stopped);
+        assert_eq!(SessionState::from_plex("garbage"), SessionState::Stopped);
+    }
+
+    #[test]
+    fn stopped_sessions_are_pruned_after_session_timeout() {
+        assert!(!should_prune(
+            Some(SessionState::Stopped),
+            SESSION_TIMEOUT - Duration::from_secs(1)
+        ));
+        assert!(should_prune(
+            Some(SessionState::Stopped),
+            SESSION_TIMEOUT + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn active_sessions_survive_until_stale_timeout_even_without_a_stop_event() {
+        // A session stuck in "playing" (e.g. a missed stop notification) must
+        // not be pruned at the short stopped-session timeout...
+        assert!(!should_prune(
+            Some(SessionState::Playing),
+            SESSION_TIMEOUT + Duration::from_secs(1)
+        ));
+        // ...but must eventually be reclaimed by the stale safety net.
+        assert!(should_prune(
+            Some(SessionState::Playing),
+            STALE_SESSION_TIMEOUT + Duration::from_secs(1)
+        ));
     }
 }

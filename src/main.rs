@@ -3,11 +3,11 @@ mod plex;
 
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio::signal;
 use tokio::sync::watch;
@@ -35,8 +35,7 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("PLEX_SERVER environment variable must be specified"))?;
     let plex_token = std::env::var("PLEX_TOKEN")
         .map_err(|_| anyhow::anyhow!("PLEX_TOKEN environment variable must be specified"))?;
-    let bind_address =
-        std::env::var("BIND_ADDRESS").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_string());
+    let bind_address = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
     let metrics_addr = format!("{bind_address}:{port}");
 

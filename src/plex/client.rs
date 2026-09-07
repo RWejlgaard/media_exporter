@@ -1,6 +1,10 @@
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::time::Duration;
 use url::Url;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -51,10 +55,14 @@ pub struct Client {
 impl Client {
     pub fn new(server_url: &str, token: &str) -> Result<Self, ClientError> {
         let base_url = Url::parse(server_url)?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()?;
         Ok(Self {
             token: token.to_string(),
             base_url,
-            http: reqwest::Client::new(),
+            http,
         })
     }
 
