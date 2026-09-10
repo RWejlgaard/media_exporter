@@ -4,6 +4,7 @@ use std::time::Duration;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use prometheus::{GaugeVec, Opts};
+use serde::de::DeserializeOwned;
 
 use crate::metrics::{GlobalMetrics, LIBRARY_LABELS};
 use crate::plex::client::{Client, ClientError};
@@ -36,7 +37,10 @@ impl ServerState {
             last_bandwidth_at: Mutex::new(unix_now()),
         });
 
-        state.refresh().await?;
+        // A failed initial refresh is deliberately not fatal. Plex being down
+        // when the exporter starts is exactly the situation `plex_up` exists to
+        // report, and crash-looping instead would take the signal with it.
+        state.refresh_and_record().await;
 
         let refresh_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -44,13 +48,27 @@ impl ServerState {
             ticker.tick().await; // skip the immediate first tick, we just refreshed above
             loop {
                 ticker.tick().await;
-                if let Err(e) = refresh_state.refresh().await {
-                    tracing::error!(error = %e, "failed to refresh server state");
-                }
+                refresh_state.refresh_and_record().await;
             }
         });
 
         Ok(state)
+    }
+
+    /// Performs a GET against the Plex API, counting a failure against
+    /// `endpoint` in `plex_scrape_errors_total`.
+    ///
+    /// `NotFound` is not counted: the Plex Pass-only statistics endpoints answer
+    /// 404 when the feature isn't licensed, which is an expected outcome rather
+    /// than a failure.
+    pub async fn get<T: DeserializeOwned>(&self, endpoint: &str, path: &str) -> Result<T, ClientError> {
+        let result = self.client.get(path).await;
+        if let Err(e) = &result
+            && !matches!(e, ClientError::NotFound)
+        {
+            self.metrics.scrape_errors_total.with_label_values(&[endpoint]).inc();
+        }
+        result
     }
 
     pub fn metrics(&self) -> &Arc<GlobalMetrics> {
@@ -78,8 +96,27 @@ impl ServerState {
         self.libraries.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Refreshes server state, recording the outcome in `plex_up` and
+    /// `plex_last_refresh_timestamp_seconds`.
+    ///
+    /// A library whose item count could not be fetched is reported through
+    /// `plex_scrape_errors_total` but does not clear `plex_up`, since the server
+    /// itself is plainly still answering.
+    async fn refresh_and_record(&self) {
+        match self.refresh().await {
+            Ok(()) => {
+                self.metrics.up.set(1.0);
+                self.metrics.last_refresh_timestamp.set(unix_now() as f64);
+            }
+            Err(e) => {
+                self.metrics.up.set(0.0);
+                tracing::error!(error = %e, "failed to refresh server state");
+            }
+        }
+    }
+
     async fn refresh(&self) -> Result<(), ClientError> {
-        let container: ProvidersResponse = self.client.get("/media/providers?includeStorage=1").await?;
+        let container: ProvidersResponse = self.get("providers", "/media/providers?includeStorage=1").await?;
 
         let mut libraries = Vec::new();
         for provider in &container.media_container.media_providers {
@@ -128,10 +165,10 @@ impl ServerState {
 
     async fn library_item_count(&self, library_id: &str) -> Result<i64, ClientError> {
         let resp: LibraryItemsResponse = self
-            .client
-            .get(&format!(
-                "/library/sections/{library_id}/all?X-Plex-Container-Start=0&X-Plex-Container-Size=0"
-            ))
+            .get(
+                "library_items",
+                &format!("/library/sections/{library_id}/all?X-Plex-Container-Start=0&X-Plex-Container-Size=0"),
+            )
             .await?;
         let container = resp.media_container;
         Ok(if container.total_size > 0 {
@@ -142,7 +179,7 @@ impl ServerState {
     }
 
     async fn refresh_server_info(&self) -> Result<(), ClientError> {
-        let resp: RootResponse = self.client.get("/").await?;
+        let resp: RootResponse = self.get("server_info", "/").await?;
 
         self.metrics
             .server_info
@@ -161,7 +198,7 @@ impl ServerState {
 
     async fn refresh_resources(&self) -> Result<(), ClientError> {
         // This is a paid feature (Plex Pass) and may not be available.
-        let resp: ResourcesResponse = match self.client.get("/statistics/resources?timespan=6").await {
+        let resp: ResourcesResponse = match self.get("resources", "/statistics/resources?timespan=6").await {
             Ok(r) => r,
             Err(ClientError::NotFound) => return Ok(()),
             Err(e) => return Err(e),
@@ -185,7 +222,7 @@ impl ServerState {
 
     async fn refresh_bandwidth(&self) -> Result<(), ClientError> {
         // This is a paid feature (Plex Pass) and may not be available.
-        let resp: BandwidthResponse = match self.client.get("/statistics/bandwidth?timespan=6").await {
+        let resp: BandwidthResponse = match self.get("bandwidth", "/statistics/bandwidth?timespan=6").await {
             Ok(r) => r,
             Err(ClientError::NotFound) => return Ok(()),
             Err(e) => return Err(e),

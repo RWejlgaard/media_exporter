@@ -1,6 +1,10 @@
-use prometheus::{CounterVec, GaugeVec, Opts};
+use prometheus::{CounterVec, Gauge, GaugeVec, Opts};
 
 pub const SERVER_LABELS: &[&str] = &["server_type", "server", "server_id"];
+
+/// Identifies which Plex API endpoint a scrape error came from. Deliberately
+/// a small, fixed set of values so the metric stays low cardinality.
+pub const ENDPOINT_LABELS: &[&str] = &["endpoint"];
 
 pub const LIBRARY_LABELS: &[&str] = &[
     "server_type",
@@ -44,7 +48,15 @@ pub const PLAY_LABELS: &[&str] = &[
 /// These mirror the promauto-registered vecs in the Go exporter: they are
 /// never reset, matching the upstream behavior of leaving stale series in
 /// place once set.
+///
+/// `up`, `scrape_errors_total` and `last_refresh_timestamp` have no upstream
+/// equivalent. They describe the exporter's own view of the Plex API, so that a
+/// server which has stopped answering is distinguishable from an idle one
+/// instead of silently freezing every other metric at its last value.
 pub struct GlobalMetrics {
+    pub up: Gauge,
+    pub scrape_errors_total: CounterVec,
+    pub last_refresh_timestamp: Gauge,
     pub server_info: GaugeVec,
     pub host_cpu_util: GaugeVec,
     pub host_mem_util: GaugeVec,
@@ -59,6 +71,21 @@ impl GlobalMetrics {
         server_info_labels.extend(["version", "platform", "platform_version"]);
 
         Ok(Self {
+            up: Gauge::new(
+                "plex_up",
+                "Whether the most recent refresh of server-level state from the Plex API succeeded",
+            )?,
+            scrape_errors_total: CounterVec::new(
+                Opts::new(
+                    "plex_scrape_errors_total",
+                    "Total number of failed requests made by the exporter to the Plex API",
+                ),
+                ENDPOINT_LABELS,
+            )?,
+            last_refresh_timestamp: Gauge::new(
+                "plex_last_refresh_timestamp_seconds",
+                "Unix timestamp of the last successful refresh; 0 until one has succeeded",
+            )?,
             server_info: GaugeVec::new(Opts::new("plex_server_info", "server_info"), &server_info_labels)?,
             host_cpu_util: GaugeVec::new(Opts::new("plex_host_cpu_util", "host_cpu_util"), SERVER_LABELS)?,
             host_mem_util: GaugeVec::new(Opts::new("plex_host_mem_util", "host_mem_util"), SERVER_LABELS)?,
@@ -84,6 +111,9 @@ impl GlobalMetrics {
     }
 
     pub fn register(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.up.clone()))?;
+        registry.register(Box::new(self.scrape_errors_total.clone()))?;
+        registry.register(Box::new(self.last_refresh_timestamp.clone()))?;
         registry.register(Box::new(self.server_info.clone()))?;
         registry.register(Box::new(self.host_cpu_util.clone()))?;
         registry.register(Box::new(self.host_mem_util.clone()))?;
@@ -91,5 +121,36 @@ impl GlobalMetrics {
         registry.register(Box::new(self.websocket_connected.clone()))?;
         registry.register(Box::new(self.websocket_reconnects_total.clone()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_global_metric_registers_and_is_exposed() {
+        let registry = prometheus::Registry::new();
+        let metrics = GlobalMetrics::new().expect("failed to build metrics");
+        metrics.register(&registry).expect("failed to register metrics");
+
+        // Vec metrics only appear in `gather()` once they have a child series.
+        metrics.scrape_errors_total.with_label_values(&["providers"]).inc();
+
+        let names: Vec<String> = registry.gather().iter().map(|mf| mf.name().to_string()).collect();
+        for expected in [
+            "plex_up",
+            "plex_scrape_errors_total",
+            "plex_last_refresh_timestamp_seconds",
+        ] {
+            assert!(names.contains(&expected.to_string()), "{expected} was not exposed");
+        }
+    }
+
+    #[test]
+    fn up_reports_down_until_a_refresh_has_succeeded() {
+        let metrics = GlobalMetrics::new().expect("failed to build metrics");
+        assert_eq!(metrics.up.get(), 0.0);
+        assert_eq!(metrics.last_refresh_timestamp.get(), 0.0);
     }
 }

@@ -6,6 +6,7 @@ A Prometheus exporter for Plex, written in Rust.
 
 | Metric | Type | Description |
 | --- | --- | --- |
+| `plex_up` | gauge | `1` if the most recent refresh of server-level state from Plex succeeded, `0` otherwise. |
 | `plex_server_info` | gauge | Always `1`. Labeled with server type/name/id, version, platform, platform version. |
 | `plex_host_cpu_util` | gauge | Host CPU utilization (requires Plex Pass). |
 | `plex_host_mem_util` | gauge | Host memory utilization (requires Plex Pass). |
@@ -21,6 +22,8 @@ A Prometheus exporter for Plex, written in Rust.
 | `plex_transcode_throttled` | gauge | Whether an active session's transcode is currently throttled. |
 | `plex_websocket_connected` | gauge | `1` while connected to Plex's notification websocket, `0` otherwise. |
 | `plex_websocket_reconnects_total` | counter | Incremented each time the notification websocket has to be (re)established. |
+| `plex_scrape_errors_total` | counter | Failed requests to the Plex API, labeled by `endpoint`. |
+| `plex_last_refresh_timestamp_seconds` | gauge | Unix timestamp of the last successful refresh; `0` until one succeeds. |
 
 ## Configuration
 
@@ -86,3 +89,39 @@ also pruned from memory a minute after they stop.
 Unlike the upstream Go exporter, the websocket connection to Plex's
 notification stream is retried with a fixed backoff on error instead of
 exiting the process.
+
+## Health and alerting
+
+Without these, a Plex server that stops answering is indistinguishable from an
+idle one: every other metric simply freezes at its last value and nothing
+alerts.
+
+- `plex_up` is `0` whenever the most recent refresh of server-level state
+  failed, and `1` once one succeeds.
+- `plex_scrape_errors_total` breaks failures down by `endpoint` — one of
+  `providers`, `library_items`, `server_info`, `resources`, `bandwidth`,
+  `sessions`, `metadata`, `websocket` — so a revoked token looks different
+  from a single unhappy library.
+- `plex_last_refresh_timestamp_seconds` is the age of the data behind every
+  other metric.
+
+```yaml
+- alert: PlexUnreachable
+  expr: plex_up == 0
+  for: 5m
+
+- alert: PlexMetricsStale
+  expr: time() - plex_last_refresh_timestamp_seconds > 300
+  for: 5m
+```
+
+A Plex server that is unreachable at startup no longer stops the exporter from
+starting. It comes up serving `plex_up 0` and keeps retrying, so an outage
+shows up in Grafana rather than as a crash-looping container.
+
+Two things deliberately do **not** count against `plex_up`. The Plex Pass-only
+endpoints (`resources`, `bandwidth`) answer `404` when the feature isn't
+licensed, which is an expected outcome and isn't recorded as an error at all. A
+library whose item count can't be fetched does increment
+`plex_scrape_errors_total{endpoint="library_items"}`, but leaves `plex_up` at
+`1`, since the server itself is plainly still answering.

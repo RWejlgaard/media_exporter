@@ -321,9 +321,14 @@ impl Collector for SessionsCollector {
             }
         }
 
-        self.estimated_transmit_bytes_total
-            .with_label_values(&["plex", &server_name, &server_id])
-            .inc_by(self.sessions.extrapolated_transmitted_bytes(&inner));
+        // Held back until the server identity is known. Emitting it before the
+        // first successful refresh would publish a series labeled with empty
+        // strings, which then lingers alongside the real one forever.
+        if !server_id.is_empty() {
+            self.estimated_transmit_bytes_total
+                .with_label_values(&["plex", &server_name, &server_id])
+                .inc_by(self.sessions.extrapolated_transmitted_bytes(&inner));
+        }
 
         drop(inner);
 
