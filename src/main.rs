@@ -40,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
     let metrics_addr = format!("{bind_address}:{port}");
 
     let registry = Arc::new(Registry::new());
+    // The process collector is Linux-only in the prometheus crate; gating it
+    // keeps the exporter buildable on other platforms for local development.
+    #[cfg(target_os = "linux")]
     registry.register(Box::new(prometheus::process_collector::ProcessCollector::for_self()))?;
 
     let global_metrics = Arc::new(GlobalMetrics::new()?);
@@ -47,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server = ServerState::connect(&server_url, &plex_token, Arc::clone(&global_metrics))
         .await
-        .map_err(|e| anyhow::anyhow!("cannot initialize connection to plex server: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot initialize plex client: {e}"))?;
 
     registry.register(Box::new(ServerCollector::new(Arc::clone(&server))?))?;
 

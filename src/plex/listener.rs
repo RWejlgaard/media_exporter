@@ -12,22 +12,36 @@ use crate::plex::models::{CurrentSessions, MediaMetadataResponse, WebsocketNotif
 use crate::plex::server::ServerState;
 use crate::plex::sessions::{SessionState, Sessions};
 
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
 /// Connects to the Plex server's notification websocket and forwards
 /// playback state changes into `Sessions`. Reconnects with a fixed delay on
 /// error or unexpected disconnect, until `shutdown` fires.
 pub async fn run(server: Arc<ServerState>, sessions: Arc<Sessions>, mut shutdown: watch::Receiver<bool>) {
     let metrics = Arc::clone(server.metrics());
-    let name = server.name();
-    let id = server.id();
-    let label_values = ["plex", name.as_str(), id.as_str()];
-
-    metrics.websocket_connected.with_label_values(&label_values).set(0.0);
 
     let mut first_attempt = true;
     loop {
         if *shutdown.borrow() {
             return;
         }
+
+        // The server's identity stays empty until a refresh has succeeded, which
+        // may not have happened yet now that an unreachable Plex no longer stops
+        // the exporter from starting. Labeling the websocket metrics with empty
+        // strings would strand that series once the real identity arrives, so
+        // wait for it rather than publish a placeholder.
+        let name = server.name();
+        let id = server.id();
+        if id.is_empty() {
+            tracing::debug!("waiting for plex server identity before connecting to the websocket");
+            tokio::select! {
+                _ = tokio::time::sleep(RECONNECT_DELAY) => continue,
+                _ = shutdown.changed() => return,
+            }
+        }
+        let label_values = ["plex", name.as_str(), id.as_str()];
+        metrics.websocket_connected.with_label_values(&label_values).set(0.0);
 
         if !first_attempt {
             metrics
@@ -41,7 +55,10 @@ pub async fn run(server: Arc<ServerState>, sessions: Arc<Sessions>, mut shutdown
             result = connect_and_listen(&server, &sessions, &metrics, &label_values) => {
                 match result {
                     Ok(()) => tracing::info!("plex websocket closed"),
-                    Err(e) => tracing::error!(error = %e, "plex websocket error, reconnecting"),
+                    Err(e) => {
+                        metrics.scrape_errors_total.with_label_values(&["websocket"]).inc();
+                        tracing::error!(error = %e, "plex websocket error, reconnecting");
+                    }
                 }
             }
             _ = shutdown.changed() => return,
@@ -50,7 +67,7 @@ pub async fn run(server: Arc<ServerState>, sessions: Arc<Sessions>, mut shutdown
         metrics.websocket_connected.with_label_values(&label_values).set(0.0);
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
             _ = shutdown.changed() => return,
         }
     }
@@ -142,7 +159,7 @@ async fn handle_notification(
 
     let mut session = None;
     for attempt in 0..=SESSION_LOOKUP_RETRIES {
-        let current: CurrentSessions = server.client.get("/status/sessions").await?;
+        let current: CurrentSessions = server.get("sessions", "/status/sessions").await?;
         session = current
             .media_container
             .metadata
@@ -160,8 +177,7 @@ async fn handle_notification(
     };
 
     let metadata: MediaMetadataResponse = server
-        .client
-        .get(&format!("/library/metadata/{}", n.rating_key))
+        .get("metadata", &format!("/library/metadata/{}", n.rating_key))
         .await?;
 
     let Some(media) = metadata.media_container.metadata.into_iter().next() else {
