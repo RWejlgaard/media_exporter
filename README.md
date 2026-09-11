@@ -1,6 +1,6 @@
-# plex-exporter
+# media-exporter
 
-A Prometheus exporter for Plex, written in Rust.
+A Prometheus exporter for Plex and Jellyfin, written in Rust.
 
 ## Metrics
 
