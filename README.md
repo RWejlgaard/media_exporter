@@ -1,4 +1,4 @@
-# plex-exporter
+# media-exporter
 
 A Prometheus exporter for Plex and Jellyfin, written in Rust. Each backend is
 independently optional and runs concurrently in the same process; enable
