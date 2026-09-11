@@ -67,8 +67,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            rwejlgaard/plex_exporter:${{ steps.version.outputs.version }}
-            rwejlgaard/plex_exporter:latest
+            rwejlgaard/media_exporter:${{ steps.version.outputs.version }}
+            rwejlgaard/media_exporter:latest
 
       - name: Tag release
         run: |

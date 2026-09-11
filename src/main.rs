@@ -1,7 +1,9 @@
+mod jellyfin;
 mod metrics;
 mod plex;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -11,14 +13,19 @@ use axum::routing::get;
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio::signal;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
-use metrics::GlobalMetrics;
-use plex::listener;
-use plex::server::{ServerCollector, ServerState};
-use plex::sessions::{Sessions, SessionsCollector};
+use jellyfin::poller as jellyfin_poller;
+use jellyfin::server::{ServerCollector as JellyfinServerCollector, ServerState as JellyfinServerState};
+use jellyfin::sessions::{Sessions as JellyfinSessions, SessionsCollector as JellyfinSessionsCollector};
+use metrics::{GlobalMetrics, JellyfinGlobalMetrics};
+use plex::listener as plex_listener;
+use plex::server::{ServerCollector as PlexServerCollector, ServerState as PlexServerState};
+use plex::sessions::{Sessions as PlexSessions, SessionsCollector as PlexSessionsCollector};
 
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0";
 const DEFAULT_PORT: &str = "9000";
+const DEFAULT_JELLYFIN_LIBRARY_STATS_INTERVAL_SECS: u64 = 1800;
 
 #[derive(Clone)]
 struct AppState {
@@ -31,10 +38,12 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let server_url = std::env::var("PLEX_SERVER")
-        .map_err(|_| anyhow::anyhow!("PLEX_SERVER environment variable must be specified"))?;
-    let plex_token = std::env::var("PLEX_TOKEN")
-        .map_err(|_| anyhow::anyhow!("PLEX_TOKEN environment variable must be specified"))?;
+    let plex_server = std::env::var("PLEX_SERVER").ok();
+    let jellyfin_server = std::env::var("JELLYFIN_SERVER").ok();
+    if plex_server.is_none() && jellyfin_server.is_none() {
+        anyhow::bail!("at least one of PLEX_SERVER or JELLYFIN_SERVER must be specified");
+    }
+
     let bind_address = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_string());
     let port = std::env::var("PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
     let metrics_addr = format!("{bind_address}:{port}");
@@ -45,17 +54,60 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     registry.register(Box::new(prometheus::process_collector::ProcessCollector::for_self()))?;
 
-    let global_metrics = Arc::new(GlobalMetrics::new()?);
-    global_metrics.register(&registry)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    let server = ServerState::connect(&server_url, &plex_token, Arc::clone(&global_metrics))
+    if let Some(server_url) = plex_server {
+        let plex_token = std::env::var("PLEX_TOKEN")
+            .map_err(|_| anyhow::anyhow!("PLEX_TOKEN environment variable must be specified alongside PLEX_SERVER"))?;
+
+        let global_metrics = Arc::new(GlobalMetrics::new()?);
+        global_metrics.register(&registry)?;
+
+        let server = PlexServerState::connect(&server_url, &plex_token, Arc::clone(&global_metrics))
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot initialize plex client: {e}"))?;
+
+        registry.register(Box::new(PlexServerCollector::new(Arc::clone(&server))?))?;
+
+        let sessions = PlexSessions::new(Arc::clone(&server));
+        registry.register(Box::new(PlexSessionsCollector::new(Arc::clone(&sessions))?))?;
+
+        background_tasks.push(tokio::spawn(plex_listener::run(server, sessions, shutdown_rx.clone())));
+    }
+
+    if let Some(server_url) = jellyfin_server {
+        let jellyfin_token = std::env::var("JELLYFIN_TOKEN").map_err(|_| {
+            anyhow::anyhow!("JELLYFIN_TOKEN environment variable must be specified alongside JELLYFIN_SERVER")
+        })?;
+        let library_stats_interval = std::env::var("JELLYFIN_LIBRARY_STATS_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_JELLYFIN_LIBRARY_STATS_INTERVAL_SECS);
+
+        let global_metrics = Arc::new(JellyfinGlobalMetrics::new()?);
+        global_metrics.register(&registry)?;
+
+        let server = JellyfinServerState::connect(
+            &server_url,
+            &jellyfin_token,
+            Duration::from_secs(library_stats_interval),
+            Arc::clone(&global_metrics),
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("cannot initialize plex client: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("cannot initialize jellyfin client: {e}"))?;
 
-    registry.register(Box::new(ServerCollector::new(Arc::clone(&server))?))?;
+        registry.register(Box::new(JellyfinServerCollector::new(Arc::clone(&server))?))?;
 
-    let sessions = Sessions::new(Arc::clone(&server));
-    registry.register(Box::new(SessionsCollector::new(Arc::clone(&sessions))?))?;
+        let sessions = JellyfinSessions::new(Arc::clone(&server));
+        registry.register(Box::new(JellyfinSessionsCollector::new(Arc::clone(&sessions))?))?;
+
+        background_tasks.push(tokio::spawn(jellyfin_poller::run(
+            server,
+            sessions,
+            shutdown_rx.clone(),
+        )));
+    }
 
     let app_state = AppState {
         registry: Arc::clone(&registry),
@@ -69,16 +121,15 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("cannot bind to {metrics_addr}: {e}"))?;
     tracing::info!("starting metrics server on {metrics_addr}");
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let listener_task = tokio::spawn(listener::run(Arc::clone(&server), sessions, shutdown_rx));
-
     axum::serve(tcp_listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     tracing::debug!("shutting down");
     let _ = shutdown_tx.send(true);
-    listener_task.abort();
+    for task in background_tasks {
+        task.abort();
+    }
 
     Ok(())
 }

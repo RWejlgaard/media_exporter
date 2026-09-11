@@ -124,6 +124,51 @@ impl GlobalMetrics {
     }
 }
 
+/// Global, always-on metrics for the Jellyfin backend. A smaller field set than
+/// `GlobalMetrics`: Jellyfin's API has no equivalent of Plex's host CPU/memory
+/// stats, real bandwidth-history stats, or transcode speed/throttled state, so
+/// those are simply not tracked here rather than approximated.
+pub struct JellyfinGlobalMetrics {
+    pub up: Gauge,
+    pub scrape_errors_total: CounterVec,
+    pub last_refresh_timestamp: Gauge,
+    pub server_info: GaugeVec,
+}
+
+impl JellyfinGlobalMetrics {
+    pub fn new() -> prometheus::Result<Self> {
+        let mut server_info_labels: Vec<&str> = SERVER_LABELS.to_vec();
+        server_info_labels.extend(["version", "platform", "platform_version"]);
+
+        Ok(Self {
+            up: Gauge::new(
+                "jellyfin_up",
+                "Whether the most recent refresh of server-level state from the Jellyfin API succeeded",
+            )?,
+            scrape_errors_total: CounterVec::new(
+                Opts::new(
+                    "jellyfin_scrape_errors_total",
+                    "Total number of failed requests made by the exporter to the Jellyfin API",
+                ),
+                ENDPOINT_LABELS,
+            )?,
+            last_refresh_timestamp: Gauge::new(
+                "jellyfin_last_refresh_timestamp_seconds",
+                "Unix timestamp of the last successful refresh; 0 until one has succeeded",
+            )?,
+            server_info: GaugeVec::new(Opts::new("jellyfin_server_info", "server_info"), &server_info_labels)?,
+        })
+    }
+
+    pub fn register(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
+        registry.register(Box::new(self.up.clone()))?;
+        registry.register(Box::new(self.scrape_errors_total.clone()))?;
+        registry.register(Box::new(self.last_refresh_timestamp.clone()))?;
+        registry.register(Box::new(self.server_info.clone()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +197,23 @@ mod tests {
         let metrics = GlobalMetrics::new().expect("failed to build metrics");
         assert_eq!(metrics.up.get(), 0.0);
         assert_eq!(metrics.last_refresh_timestamp.get(), 0.0);
+    }
+
+    #[test]
+    fn every_jellyfin_global_metric_registers_and_is_exposed() {
+        let registry = prometheus::Registry::new();
+        let metrics = JellyfinGlobalMetrics::new().expect("failed to build metrics");
+        metrics.register(&registry).expect("failed to register metrics");
+
+        metrics.scrape_errors_total.with_label_values(&["sessions"]).inc();
+
+        let names: Vec<String> = registry.gather().iter().map(|mf| mf.name().to_string()).collect();
+        for expected in [
+            "jellyfin_up",
+            "jellyfin_scrape_errors_total",
+            "jellyfin_last_refresh_timestamp_seconds",
+        ] {
+            assert!(names.contains(&expected.to_string()), "{expected} was not exposed");
+        }
     }
 }
