@@ -1,4 +1,5 @@
 mod jellyfin;
+mod media;
 mod metrics;
 mod plex;
 
@@ -10,6 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use prometheus::core::Collector;
 use prometheus::{Encoder, Registry, TextEncoder};
 use tokio::signal;
 use tokio::sync::watch;
@@ -18,6 +20,7 @@ use tokio::task::JoinHandle;
 use jellyfin::poller as jellyfin_poller;
 use jellyfin::server::{ServerCollector as JellyfinServerCollector, ServerState as JellyfinServerState};
 use jellyfin::sessions::{Sessions as JellyfinSessions, SessionsCollector as JellyfinSessionsCollector};
+use media::MediaCollector;
 use metrics::{GlobalMetrics, JellyfinGlobalMetrics};
 use plex::listener as plex_listener;
 use plex::server::{ServerCollector as PlexServerCollector, ServerState as PlexServerState};
@@ -56,22 +59,26 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut background_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Collected per backend rather than registered straight away, so that with
+    // more than one backend they can be wrapped in a `MediaCollector`.
+    let mut backend_collectors: Vec<Vec<Box<dyn Collector>>> = Vec::new();
 
     if let Some(server_url) = plex_server {
         let plex_token = std::env::var("PLEX_TOKEN")
             .map_err(|_| anyhow::anyhow!("PLEX_TOKEN environment variable must be specified alongside PLEX_SERVER"))?;
 
         let global_metrics = Arc::new(GlobalMetrics::new()?);
-        global_metrics.register(&registry)?;
+        let mut collectors = global_metrics.collectors();
 
         let server = PlexServerState::connect(&server_url, &plex_token, Arc::clone(&global_metrics))
             .await
             .map_err(|e| anyhow::anyhow!("cannot initialize plex client: {e}"))?;
 
-        registry.register(Box::new(PlexServerCollector::new(Arc::clone(&server))?))?;
+        collectors.push(Box::new(PlexServerCollector::new(Arc::clone(&server))?));
 
         let sessions = PlexSessions::new(Arc::clone(&server));
-        registry.register(Box::new(PlexSessionsCollector::new(Arc::clone(&sessions))?))?;
+        collectors.push(Box::new(PlexSessionsCollector::new(Arc::clone(&sessions))?));
+        backend_collectors.push(collectors);
 
         background_tasks.push(tokio::spawn(plex_listener::run(server, sessions, shutdown_rx.clone())));
     }
@@ -86,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(DEFAULT_JELLYFIN_LIBRARY_STATS_INTERVAL_SECS);
 
         let global_metrics = Arc::new(JellyfinGlobalMetrics::new()?);
-        global_metrics.register(&registry)?;
+        let mut collectors = global_metrics.collectors();
 
         let server = JellyfinServerState::connect(
             &server_url,
@@ -97,16 +104,26 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("cannot initialize jellyfin client: {e}"))?;
 
-        registry.register(Box::new(JellyfinServerCollector::new(Arc::clone(&server))?))?;
+        collectors.push(Box::new(JellyfinServerCollector::new(Arc::clone(&server))?));
 
         let sessions = JellyfinSessions::new(Arc::clone(&server));
-        registry.register(Box::new(JellyfinSessionsCollector::new(Arc::clone(&sessions))?))?;
+        collectors.push(Box::new(JellyfinSessionsCollector::new(Arc::clone(&sessions))?));
+        backend_collectors.push(collectors);
 
         background_tasks.push(tokio::spawn(jellyfin_poller::run(
             server,
             sessions,
             shutdown_rx.clone(),
         )));
+    }
+
+    if backend_collectors.len() > 1 {
+        let sources = backend_collectors.into_iter().flatten().collect();
+        registry.register(Box::new(MediaCollector::new(sources)?))?;
+    } else {
+        for collector in backend_collectors.into_iter().flatten() {
+            registry.register(collector)?;
+        }
     }
 
     let app_state = AppState {

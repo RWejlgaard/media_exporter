@@ -54,6 +54,34 @@ require scanning every item's `MediaSources`, too expensive - see below), or
 speed multiplier or throttled flag, only codec/bitrate/completion state).
 Rather than approximate these, they're simply not emitted for `jellyfin_`.
 
+### Merged (`media_` prefix)
+
+When both Plex and Jellyfin are configured, every metric the two backends
+have in common is additionally exposed under a `media_` prefix, combining
+the series of both into one metric family. The `plex_`/`jellyfin_` metrics
+are still exposed unchanged alongside them.
+
+| Metric | Merges |
+| --- | --- |
+| `media_up` | `plex_up`, `jellyfin_up` |
+| `media_scrape_errors_total` | `plex_scrape_errors_total`, `jellyfin_scrape_errors_total` |
+| `media_last_refresh_timestamp_seconds` | `plex_last_refresh_timestamp_seconds`, `jellyfin_last_refresh_timestamp_seconds` |
+| `media_server_info` | `plex_server_info`, `jellyfin_server_info` |
+| `media_library_duration_total` | `plex_library_duration_total`, `jellyfin_library_duration_total` |
+| `media_library_items_total` | `plex_library_items_total`, `jellyfin_library_items_total` |
+| `media_plays_total` | `plex_plays_total`, `jellyfin_plays_total` |
+| `media_play_seconds_total` | `plex_play_seconds_total`, `jellyfin_play_seconds_total` |
+| `media_estimated_transmit_bytes_total` | `plex_estimated_transmit_bytes_total`, `jellyfin_estimated_transmit_bytes_total` |
+| `media_active_sessions` | `plex_active_sessions`, `jellyfin_active_sessions` |
+
+Series keep their original labels and are told apart by `server_type`
+(`plex`/`jellyfin`), which is added to `media_up`, `media_scrape_errors_total`
+and `media_last_refresh_timestamp_seconds` since their per-backend
+counterparts don't carry it. Aggregate across servers as usual, e.g.
+`sum(media_plays_total)` or `sum by (user) (media_play_seconds_total)`.
+Metrics only one backend has (e.g. `plex_transcode_speed`) aren't merged.
+With a single backend configured, no `media_` metrics are emitted.
+
 #### Library stats cost
 
 Plex returns a library's total duration and storage size as part of a single,

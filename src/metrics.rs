@@ -1,3 +1,4 @@
+use prometheus::core::Collector;
 use prometheus::{CounterVec, Gauge, GaugeVec, Opts};
 
 pub const SERVER_LABELS: &[&str] = &["server_type", "server", "server_id"];
@@ -110,17 +111,23 @@ impl GlobalMetrics {
         })
     }
 
+    pub fn collectors(&self) -> Vec<Box<dyn Collector>> {
+        vec![
+            Box::new(self.up.clone()),
+            Box::new(self.scrape_errors_total.clone()),
+            Box::new(self.last_refresh_timestamp.clone()),
+            Box::new(self.server_info.clone()),
+            Box::new(self.host_cpu_util.clone()),
+            Box::new(self.host_mem_util.clone()),
+            Box::new(self.transmit_bytes_total.clone()),
+            Box::new(self.websocket_connected.clone()),
+            Box::new(self.websocket_reconnects_total.clone()),
+        ]
+    }
+
+    #[cfg(test)]
     pub fn register(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
-        registry.register(Box::new(self.up.clone()))?;
-        registry.register(Box::new(self.scrape_errors_total.clone()))?;
-        registry.register(Box::new(self.last_refresh_timestamp.clone()))?;
-        registry.register(Box::new(self.server_info.clone()))?;
-        registry.register(Box::new(self.host_cpu_util.clone()))?;
-        registry.register(Box::new(self.host_mem_util.clone()))?;
-        registry.register(Box::new(self.transmit_bytes_total.clone()))?;
-        registry.register(Box::new(self.websocket_connected.clone()))?;
-        registry.register(Box::new(self.websocket_reconnects_total.clone()))?;
-        Ok(())
+        self.collectors().into_iter().try_for_each(|c| registry.register(c))
     }
 }
 
@@ -160,12 +167,18 @@ impl JellyfinGlobalMetrics {
         })
     }
 
+    pub fn collectors(&self) -> Vec<Box<dyn Collector>> {
+        vec![
+            Box::new(self.up.clone()),
+            Box::new(self.scrape_errors_total.clone()),
+            Box::new(self.last_refresh_timestamp.clone()),
+            Box::new(self.server_info.clone()),
+        ]
+    }
+
+    #[cfg(test)]
     pub fn register(&self, registry: &prometheus::Registry) -> prometheus::Result<()> {
-        registry.register(Box::new(self.up.clone()))?;
-        registry.register(Box::new(self.scrape_errors_total.clone()))?;
-        registry.register(Box::new(self.last_refresh_timestamp.clone()))?;
-        registry.register(Box::new(self.server_info.clone()))?;
-        Ok(())
+        self.collectors().into_iter().try_for_each(|c| registry.register(c))
     }
 }
 
